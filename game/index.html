@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost Dodge — a tiny browser game</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0710; height: 100%; overflow: hidden; }
+  #game { display: block; width: 100vw; height: 100vh; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 14px; text-align: center;
+    color: rgba(255,255,255,.55); font: 15px/1.4 system-ui, sans-serif;
+    pointer-events: none; letter-spacing: .04em;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="1920" height="1080"></canvas>
+<div id="hint">Move: mouse / arrows / WASD &nbsp;·&nbsp; dodge the meteors, catch the stars &nbsp;·&nbsp; press R to restart</div>
+<script>
+"use strict";
+/* Ghost Dodge — a tiny browser game.
+   One ghost, falling meteors, collectible stars. 3 lives, score climbs.
+   Pure step(state, dt) + draw(state) so the game is deterministic and
+   scriptable: window.GHOSTDODGE.renderAt(ms) draws any moment in time. */
+
+const W = 1920, H = 1080;
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+/* Seeded RNG (mulberry32) — same run every time for the same seed. */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function makeState(seed) {
+  const rng = mulberry32(seed);
+  const stars = [];
+  for (let i = 0; i < 90; i++) {
+    stars.push({ x: rng() * W, y: rng() * H, r: rng() * 1.8 + 0.6, tw: rng() * 6.28 });
+  }
+  return {
+    t: 0, seed, rng,
+    px: W / 2, py: H - 260, pvx: 0, pvy: 0,
+    score: 0, lives: 3, over: false, overAt: 0,
+    inv: 0, flash: 0, shake: 0,
+    meteors: [], pickups: [], parts: [],
+    spawnT: 0, starT: 0, elapsed: 0,
+    bg: stars,
+    keys: {},
+    auto: false, mouse: null,
+    best: 0,
+  };
+}
+
+let S = makeState(1409);
+
+function spawnMeteor(s) {
+  const r = 26 + s.rng() * 42;
+  const speed = 260 + s.rng() * 260 + Math.min(420, s.elapsed * 6);
+  s.meteors.push({
+    x: 60 + s.rng() * (W - 120), y: -r - 10,
+    vx: (s.rng() - 0.5) * 140, vy: speed, r,
+    rot: s.rng() * 6.28, vr: (s.rng() - 0.5) * 2.4,
+    hue: s.rng(),
+  });
+}
+
+function spawnStar(s) {
+  s.pickups.push({
+    x: 80 + s.rng() * (W - 160), y: 120 + s.rng() * (H - 320),
+    r: 22, born: s.t, bob: s.rng() * 6.28,
+  });
+}
+
+function burst(s, x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = s.rng() * 6.283, sp = 120 + s.rng() * 420;
+    s.parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.7, color });
+  }
+}
+
+/* Autopilot: chase the nearest star, sidestep the nearest danger. */
+function autopilot(s, dt) {
+  let tx = s.px, ty = s.py;
+  let best = null, bd = 1e9;
+  for (const p of s.pickups) {
+    const d = (p.x - s.px) ** 2 + (p.y - s.py) ** 2;
+    if (d < bd) { bd = d; best = p; }
+  }
+  if (best) { tx = best.x; ty = best.y; }
+  for (const m of s.meteors) {
+    const dy = m.y - s.py;
+    if (dy > -420 && dy < 130) {
+      const dx = m.x - s.px;
+      if (Math.abs(dx) < m.r + 90) {
+        tx = s.px + (dx > 0 ? -260 : 260); // dodge away
+        ty = s.py + 60;
+      }
+    }
+  }
+  const k = Math.min(1, dt * 6);
+  s.pvx += ((tx - s.px) * 6 - s.pvx) * k;
+  s.pvy += ((ty - s.py) * 6 - s.pvy) * k;
+}
+
+function step(s, dt) {
+  if (s.over) { s.t += dt; return; }
+  s.t += dt; s.elapsed += dt;
+  s.inv = Math.max(0, s.inv - dt);
+  s.flash = Math.max(0, s.flash - dt * 2);
+  s.shake = Math.max(0, s.shake - dt * 3);
+
+  /* Input: autopilot, mouse, or keys. */
+  if (s.auto) autopilot(s, dt);
+  else if (s.mouse) {
+    const k = Math.min(1, dt * 8);
+    s.pvx += ((s.mouse.x - s.px) * 8 - s.pvx) * k;
+    s.pvy += ((s.mouse.y - s.py) * 8 - s.pvy) * k;
+  } else {
+    const ax = (s.keys.ArrowRight || s.keys.KeyD ? 1 : 0) - (s.keys.ArrowLeft || s.keys.KeyA ? 1 : 0);
+    const ay = (s.keys.ArrowDown || s.keys.KeyS ? 1 : 0) - (s.keys.ArrowUp || s.keys.KeyW ? 1 : 0);
+    s.pvx += ax * 5200 * dt; s.pvy += ay * 5200 * dt;
+    s.pvx *= Math.pow(0.0015, dt); s.pvy *= Math.pow(0.0015, dt);
+  }
+  s.px = Math.max(50, Math.min(W - 50, s.px + s.pvx * dt));
+  s.py = Math.max(50, Math.min(H - 50, s.py + s.pvy * dt));
+
+  /* Spawning ramps up with time. */
+  s.spawnT -= dt;
+  if (s.spawnT <= 0) {
+    spawnMeteor(s);
+    s.spawnT = Math.max(0.16, 0.62 - s.elapsed * 0.006) * (0.7 + s.rng() * 0.6);
+  }
+  s.starT -= dt;
+  if (s.starT <= 0 && s.pickups.length < 3) { spawnStar(s); s.starT = 1.6 + s.rng() * 1.4; }
+
+  /* Meteors. */
+  for (let i = s.meteors.length - 1; i >= 0; i--) {
+    const m = s.meteors[i];
+    m.x += m.vx * dt; m.y += m.vy * dt; m.rot += m.vr * dt;
+    if (m.y - m.r > H + 40 || m.x < -120 || m.x > W + 120) { s.meteors.splice(i, 1); continue; }
+    const dx = m.x - s.px, dy = m.y - s.py, rr = m.r + 34;
+    if (dx * dx + dy * dy < rr * rr && s.inv <= 0) {
+      s.lives -= 1; s.inv = 2.0; s.flash = 1; s.shake = 1;
+      burst(s, s.px, s.py, "#ff5d8f", 26);
+      s.meteors.splice(i, 1);
+      if (s.lives <= 0) { s.over = true; s.overAt = s.t; burst(s, s.px, s.py, "#ffffff", 60); }
+    }
+  }
+
+  /* Stars. */
+  for (let i = s.pickups.length - 1; i >= 0; i--) {
+    const p = s.pickups[i];
+    const dx = p.x - s.px, dy = p.y - s.py;
+    if (dx * dx + dy * dy < (p.r + 40) * (p.r + 40)) {
+      s.score += 10; s.pickups.splice(i, 1);
+      burst(s, p.x, p.y, "#ffd166", 14);
+    } else if (s.t - p.born > 9) s.pickups.splice(i, 1);
+  }
+
+  /* Survival trickle: +1 per second alive. */
+  s.score += dt * 1;
+
+  for (let i = s.parts.length - 1; i >= 0; i--) {
+    const p = s.parts[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.98; p.vy *= 0.98; p.life -= dt;
+    if (p.life <= 0) s.parts.splice(i, 1);
+  }
+  s.best = Math.max(s.best, Math.floor(s.score));
+}
+
+/* ---------- drawing ---------- */
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawGhost(x, y, scale, blink) {
+  ctx.save();
+  ctx.translate(x, y); ctx.scale(scale, scale);
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  ctx.moveTo(-34, 26);
+  ctx.lineTo(-34, -6);
+  ctx.arc(0, -6, 34, Math.PI, 0);
+  ctx.lineTo(34, 26);
+  for (let i = 0; i < 4; i++) {
+    const cx = 34 - i * 17;
+    ctx.quadraticCurveTo(cx - 8.5, 14, cx - 17, 26);
+  }
+  ctx.closePath(); ctx.fill();
+  /* eyes */
+  ctx.fillStyle = "#191419";
+  const eh = blink ? 2 : 9;
+  ctx.beginPath(); ctx.ellipse(-13, -8, 6, eh, 0, 0, 6.29); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(13, -8, 6, eh, 0, 0, 6.29); ctx.fill();
+  /* blush */
+  ctx.fillStyle = "rgba(196,28,131,.55)";
+  ctx.beginPath(); ctx.ellipse(-22, 6, 6, 4, 0, 0, 6.29); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(22, 6, 6, 4, 0, 0, 6.29); ctx.fill();
+  ctx.restore();
+}
+
+function drawMeteor(m) {
+  ctx.save();
+  ctx.translate(m.x, m.y); ctx.rotate(m.rot);
+  const g = ctx.createRadialGradient(-m.r * 0.3, -m.r * 0.3, m.r * 0.1, 0, 0, m.r);
+  g.addColorStop(0, m.hue > 0.5 ? "#8d6bff" : "#ff7a59");
+  g.addColorStop(1, "#3a0d2e");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  const n = 9;
+  for (let i = 0; i <= n; i++) {
+    const a = (i / n) * 6.283;
+    const rr = m.r * (0.82 + 0.18 * Math.sin(a * 3 + m.rot));
+    const px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.25)";
+  ctx.beginPath(); ctx.arc(-m.r * 0.3, -m.r * 0.35, m.r * 0.22, 0, 6.29); ctx.fill();
+  ctx.restore();
+}
+
+function draw(s) {
+  ctx.save();
+  if (s.shake > 0) ctx.translate((Math.random() - 0.5) * s.shake * 18, (Math.random() - 0.5) * s.shake * 18);
+  /* space */
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#12081f"); bg.addColorStop(0.6, "#0b0710"); bg.addColorStop(1, "#160a24");
+  ctx.fillStyle = bg; ctx.fillRect(-30, -30, W + 60, H + 60);
+  for (const st of s.bg) {
+    const a = 0.35 + 0.4 * Math.abs(Math.sin(s.t * 0.8 + st.tw));
+    ctx.fillStyle = `rgba(255,255,255,${a.toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(st.x, st.y, st.r, 0, 6.29); ctx.fill();
+  }
+  /* nebula blobs */
+  ctx.globalAlpha = 0.10;
+  ctx.fillStyle = "#c41c83"; ctx.beginPath(); ctx.arc(300, 220, 260, 0, 6.29); ctx.fill();
+  ctx.fillStyle = "#5b2ee5"; ctx.beginPath(); ctx.arc(1680, 820, 300, 0, 6.29); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  /* stars to collect */
+  for (const p of s.pickups) {
+    const bobY = Math.sin(s.t * 2 + p.bob) * 8;
+    const pulse = 1 + 0.12 * Math.sin(s.t * 4 + p.bob);
+    ctx.save(); ctx.translate(p.x, p.y + bobY); ctx.scale(pulse, pulse);
+    ctx.fillStyle = "#ffd166";
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i * Math.PI) / 5;
+      const rr = i % 2 === 0 ? 24 : 10;
+      const px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  for (const m of s.meteors) drawMeteor(m);
+
+  /* particles */
+  for (const p of s.parts) {
+    ctx.globalAlpha = Math.max(0, p.life / 0.7);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, 6.29); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  /* player ghost (blink while invincible) */
+  if (s.inv <= 0 || Math.floor(s.t * 10) % 2 === 0) {
+    const blink = (s.t % 3.7) < 0.12;
+    drawGhost(s.px, s.py, 1, blink);
+  }
+
+  /* HUD */
+  ctx.fillStyle = "rgba(255,255,255,.92)";
+  ctx.font = "700 44px system-ui, sans-serif";
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  ctx.fillText("SCORE  " + Math.floor(s.score), 48, 78);
+  ctx.font = "600 30px system-ui, sans-serif";
+  ctx.fillStyle = "rgba(255,255,255,.6)";
+  ctx.fillText("GHOST DODGE", 48, 122);
+  /* lives */
+  for (let i = 0; i < 3; i++) {
+    ctx.save(); ctx.translate(W - 90 - i * 72, 62); ctx.scale(0.62, 0.62);
+    ctx.globalAlpha = i < s.lives ? 1 : 0.22;
+    drawGhost(0, 0, 1, false);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+
+  if (s.flash > 0) {
+    ctx.fillStyle = `rgba(255,60,110,${(s.flash * 0.28).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (s.over) {
+    ctx.fillStyle = "rgba(11,7,16,.72)"; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "800 110px system-ui, sans-serif";
+    ctx.fillText("GAME OVER", W / 2, H / 2 - 30);
+    ctx.font = "600 46px system-ui, sans-serif";
+    ctx.fillStyle = "#ffd166";
+    ctx.fillText("SCORE  " + Math.floor(s.score), W / 2, H / 2 + 60);
+    ctx.fillStyle = "rgba(255,255,255,.75)";
+    ctx.font = "500 32px system-ui, sans-serif";
+    ctx.fillText("press R to play again", W / 2, H / 2 + 130);
+  }
+  ctx.restore();
+}
+
+/* ---------- live loop + input ---------- */
+
+let last = performance.now();
+function frame(now) {
+  if (window.__frozen) { requestAnimationFrame(frame); return; }
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  step(S, dt);
+  draw(S);
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener("keydown", (e) => {
+  S.keys[e.code] = true;
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"].includes(e.code)) e.preventDefault();
+  if (e.code === "KeyR") { S = makeState(1409); S.auto = window.__auto || false; }
+});
+window.addEventListener("keyup", (e) => { S.keys[e.code] = false; });
+canvas.addEventListener("pointermove", (e) => {
+  const r = canvas.getBoundingClientRect();
+  S.mouse = { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+});
+canvas.addEventListener("pointerleave", () => { S.mouse = null; });
+
+/* Deterministic render hook for video capture: draw state at time t (ms). */
+window.GHOSTDODGE = {
+  renderAt(ms) {
+    window.__frozen = true;
+    const target = ms / 1000;
+    S = makeState(1409);
+    S.auto = true;
+    const dt = 1 / 60;
+    while (S.t < target) step(S, Math.min(dt, target - S.t));
+    draw(S);
+    return { t: S.t, score: Math.floor(S.score), lives: S.lives, over: S.over };
+  },
+  state() { return S; },
+};
+
+/* Autopilot on ?auto=1 (used for the video capture). */
+if (new URLSearchParams(location.search).get("auto") === "1") {
+  window.__auto = true;
+  S.auto = true;
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
